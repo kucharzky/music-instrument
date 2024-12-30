@@ -2,8 +2,8 @@
 	Technika Mikroprocesorowa 2 - CWP
 	Projekt nr 18 - Instrument muzyczny (13 dźwięków) sterowany akcelerometrem
 	autor: Maciej Kucharski
-	wersja: 29.12.2024r.
-	rev 1.1
+	wersja: 30.12.2024r.
+	rev 1.2
 ------------------------------------------------------------------------------*/
 
 #include "MKL05Z4.h"
@@ -18,8 +18,9 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define DIV_CORE	20000	// Przerwanie co 1ms - dźwięk 250Hz (co drugie przerwanie wyzwala DAC0)
-#define ACCEL_SENSITIVITY 2 // Czułość akcelerometru 2g
+#define DIV_CORE	10000	// Przerwanie co 0.5ms - dźwięk 250Hz (co drugie przerwanie wyzwala DAC0)
+#define ACCEL_SENSITIVITY 1 // Czułość akcelerometru 
+#define ACCEL_UPDATE_PERIOD 50 // Okres odczytu danych z akcelerometru w ms
 
 // Częstotliwości dla 13 dźwięków (C4 do C5)
 const float frequencies[] = {
@@ -49,22 +50,20 @@ const int32_t Pila[] = {0, 205, 409, 614, 819, 1024, 1228, 1433, 1638, 1842, 204
 volatile float n;
 volatile uint8_t trig = 0;
 
-// Flaga do obsługi slidera
-volatile uint8_t update_slider = 0;
+// Zmienne do obsługi akcelerometru i wyświetlacza
+volatile uint8_t update_accel = 0;
+volatile int16_t accelX = 0;
+volatile uint8_t update_display = 0;
 
 void SysTick_Handler(void)
 {
-    // Obsługa akcelerometru
-    uint8_t accelData[6];
-    I2C_ReadRegBlock(0x1D, 0x1, 6, accelData);
-    int16_t accelX = (int16_t)((accelData[0] << 8) | accelData[1]) >> 2;
-
-    currentNote = 6.5f + (float)accelX / 4096.0f * 6.0f;
-    if (currentNote < 0) currentNote = 0;
-    if (currentNote > 12) currentNote = 12;
-
-	// Zmiana stanu flagi
-	update_slider = 1;
+    // Flaga do aktualizacji danych z akcelerometru
+    static uint32_t accel_count = 0;
+    accel_count++;
+    if (accel_count >= ACCEL_UPDATE_PERIOD) {
+        update_accel = 1;
+        accel_count = 0;
+    }
 
     trig ^= 0x1;
     if (trig)
@@ -95,12 +94,6 @@ void SysTick_Handler(void)
         {
             n = fmod(n, n_range);
         }
-
-        // Wyświetlanie nazwy nuty i oktawy
-        char display[17];
-        LCD1602_SetCursor(0, 0);
-        sprintf(display, "%s%d", noteNames[(int)round(currentNote)], octave + 4);
-        LCD1602_Print(display);
     }
 }
 
@@ -110,40 +103,23 @@ void PORTA_IRQHandler(void)
     buf = PORTA->ISFR;
 
     if (buf & (1 << 10)) { // S2
-        if (!S2_press) {
-            S2_press = 1;
-            octave++;
-            if (octave > 3) octave = 3;
-        }
+        S2_press = 1;
+		octave++;
+		if (octave > 3) octave = 3;
         PORTA->ISFR |= (1 << 10);
     }
 
     if (buf & (1 << 11)) { // S3
-        if (!S3_press) {
-            S3_press = 1;
-            octave--;
-            if (octave < -3) octave = -3;
-        }
+        S3_press = 1;
+		octave--;
+		if (octave < -3) octave = -3;
         PORTA->ISFR |= (1 << 11);
     }
 
     if (buf & (1 << 12)) { // S4
-        if (!S4_press) {
-            S4_press = 1;
-            waveForm = (waveForm + 1) % 3;
-            LCD1602_SetCursor(8, 1);
-            switch (waveForm) {
-                case 0:
-                    LCD1602_Print("Sinus   ");
-                    break;
-                case 1:
-                    LCD1602_Print("Trojkat ");
-                    break;
-                case 2:
-                    LCD1602_Print("Pila    ");
-                    break;
-            }
-        }
+		S4_press = 1;
+		waveForm = (waveForm + 1) % 3;
+		update_display = 1;
         PORTA->ISFR |= (1 << 12);
     }
 		
@@ -207,28 +183,45 @@ int main(void)
 
     while (1)
     {
-        // Obsługa slidera
-        if (update_slider)
-        {
-            update_slider = 0;
+		// Obsługa akcelerometru
+        if (update_accel) {
+            update_accel = 0;
+            uint8_t accelData[6];
+            I2C_ReadRegBlock(0x1D, 0x01, 6, accelData);
+            accelX = (int16_t)((accelData[0] << 8) | accelData[1]) >> 2;
+            currentNote = 6.5f + (float)accelX / 4096.0f * 6.0f;
+            if (currentNote < 0) currentNote = 0;
+            if (currentNote > 12) currentNote = 12;
+			update_display = 1; // Zasygnalizowanie konieczności aktualizacji wyświetlacza
+        }
+        // Obsługa wyświetlacza
+        if (update_display) {
+            update_display = 0;
+            LCD1602_SetCursor(0, 0);
+            sprintf(display, "%s%d", noteNames[(int)round(currentNote)], octave + 4);
+            LCD1602_Print(display);
 
-            uint8_t sliderValue = TSI_ReadSlider();
-            if (sliderValue != 0)
-            {
-                volume = sliderValue;
-                LCD1602_SetCursor(0, 1);
-                sprintf(display, "Vol: %3d", volume);
-                LCD1602_Print(display);
+            LCD1602_SetCursor(8, 1);
+            switch (waveForm) {
+                case 0:
+                    LCD1602_Print("Sinus   ");
+                    break;
+                case 1:
+                    LCD1602_Print("Trojkat ");
+                    break;
+                case 2:
+                    LCD1602_Print("Pila    ");
+                    break;
             }
         }
-		if (S2_press) {
-			S2_press = 0;
-		}
-		if (S3_press) {
-			S3_press = 0;
-		}
-		if (S4_press) {
-			S4_press = 0;
-		}
+
+        // Obsługa slidera
+        uint8_t sliderValue = TSI_ReadSlider();
+        if (sliderValue != 0) {
+            volume = sliderValue;
+            LCD1602_SetCursor(0, 1);
+            sprintf(display, "Vol: %3d", volume);
+            LCD1602_Print(display);
+        }
     }
 }
